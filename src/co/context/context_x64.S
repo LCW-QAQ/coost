@@ -42,62 +42,123 @@
  */
 #ifdef _WIN32
 
+/*
+ * make context (refer to boost.context)
+ *
+ *
+ *             -----------------------------------------------------------------------------------------
+ * stackdata: |                                                          |         context        |||||||
+ *             -----------------------------------------------------------------------------------|-----
+ *                                                                                           (16-align)
+ *
+ *
+ *             ---------------------------------------
+ * context:   |  fiber  | dealloc |  limit  |  base   |
+ *             ---------------------------------------
+ *            0         8         16         24
+ *
+ *             ---------------------------------------
+ *            |   r12   |   r13   |   r14   |   r15   |
+ *             ---------------------------------------
+ *            32        40        48        56                 -------------------------------------------------------
+ *                                                            |                                                       |
+ *                                    func    __end           |         __entry      arguments                    retval(from)
+ *             ----------------------------------------------------------------------------------------------------------------------------------
+ *            |   rdi   |   rsi   |   rbx   |   rbp   | retval(saved) |   rip   |   from(ctx/priv)  | context(unused) |  priv(unused)  | padding |
+ *             ----------------------------------------------------------------------------------------------------------------------------------
+ *            64        72        80        88        96              104       112                 128               136              144
+ *                                                                              |
+ *                                                                              | 16-align
+ *                                                                              |
+ *                                                                    rsp when jump to function
+ *
+ *
+ * @param stackdata     the stack data (rcx)
+ * @param stacksize     the stack size (rdx)
+ * @param func          the entry function (r8)
+ *
+ * @return              the context pointer (rax)
+ */
 function(tb_context_make)
 
     // save the stack top to rax
+    // 将rax指向栈顶（高地址）
     movq %rcx, %rax
     addq %rdx, %rax
 
     // reserve space for first argument(from) and retval(from) item of context-function
+    // 32 预留给目标函数的第一个参数from和返回值from，from内部包含两个指针，也就是16字节，两个from参数自然要预留32字节
     subq $32, %rax
 
     // 16-align of the stack top address
+    // 微软x64规定栈顶必须16字节对齐，该操作对栈顶进行16字节对齐。
+    // 本质就是确保栈顶地址最后一位一定是0（注意是16进制，列如0x00000ff0）
     andq $-16, %rax
 
     // reserve space for context-data on context-stack
+    // 为上下文变量保留112字节（用来保存各种寄存器）
+    // 栈顶（高地址）的32字节保留目标函数参数与返回值，后续112字节其他上下文信息（寄存器与目标函数地址）
     subq $112, %rax
 
     // context.rbx = func
+    // context_data[80..88]保存目标函数地址
     movq %r8, 80(%rax)
 
     // save bottom address of context stack as 'limit'
+    // context_data[16..24]保存栈底
     movq %rcx, 16(%rax)
 
     // save address of context stack limit as 'dealloction stack'
+    // context_data[8..16]保存栈底
     movq %rcx, 8(%rax)
 
     // save top address of context stack as 'base'
+    // rcx此时还是指向栈底的，加上rdx(stack_size)后，得到栈顶地址
     addq %rdx, %rcx
+    // 将栈顶地址保存到context_data[24..32]
     movq %rcx, 24(%rax)
 
     // init fiber-storage to zero
     xorq %rcx, %rcx
+    // 将context_data[0..8]初始化为0
     movq %rcx, (%rax)
 
     // init context.retval(saved) = a writeable space (unused)
     // it will write context (unused) and priv (unused) when jump to a new context function entry first
     leaq 128(%rax), %rcx
+    // 将context_data[128]的地址存储到context_data[96..104]
+    // context_data[128..144]存储的就是目标函数的from返回值
+    // 第一次创建上下文时，返回值是
     movq %rcx, 96(%rax)
 
     // context.rip = the address of label __entry
     leaq __entry(%rip), %rcx
+    // 将__entry的地址保存到context_data[104..102]
     movq %rcx, 104(%rax)
 
     // context.end = the address of label __end
     leaq __end(%rip), %rcx
+    // 将__end的地址保存到context_data[88..96]
     movq %rcx, 88(%rax)
 
     // return pointer to context-data
+    // 此时rax存储是上下文变量context_data的地址（低地址）
+    // context_data_pointer的高地址就是上下文变量（保存的寄存器、栈顶、栈底、目标函数、目标函数参数、目标函数返回值等信息）
+    // context_data_pointer的低地址部分就是协程栈空间，大小为(stack_size-32-112=stack_size-144，还要加上16字节对齐的填充部分，目前先不关心)
     ret
 
 __entry:
     // patch return address (__end) on stack
+    // rbp存储__end默认退出的地址，将__end入栈作为函数返回地址
+    // 这样就实现了，如果函数内部未进行上下文未切换，此时直接调用系统提供的退出函数，结束程序。
     push %rbp
 
     // jump to the context function entry(rip)
+    // 跳转到目标函数
     jmp *%rbx
 
 __end:
+    // exit(0)
     xorq %rcx, %rcx
     call _exit
     hlt
@@ -106,11 +167,25 @@ endfunc
 
 
 function(tb_context_jump)
+    // 这里有个至关重要的细节！
+    // 调用方使用call指令调用函数时，会将cs、rip寄存器入栈，以便函数执行结束后，ret指令返回到调用处。
+    // （？？观察目前代码实现，貌似只考虑近跳，因此不会压入cs。如果压入cs，代码没有手动清理，可能产生栈异常？入栈的参数是由调用方手动清理的，不用关系，但是cs的清理得由被调用方处理）
+    // (解释上一行的疑问：不要再用8086的角度思考问题了，由于8086寄存都是16位，因此一个代码段最大只有2^16=64KB，导致产生很多代码段，需要分段管理，
+    // 跨段跳转使用jmp far、call far，但是现代计算机可是64位的，可以寻址的范围远超你的内存，早就不需要再因寻址范围而划分代码段了，所有代码都可以直接使用近跳转)
+    // 我们正是利用了这种规则，没有显示入栈rip寄存器，而是利用call指令自带的功能将rip入栈。
+    // 当恢复__entry(rip)的时候，如果是第一次make_context、jump跳转，此时出栈__entry(rip)的时候，是make指定的函数地址。
+    // 而当jump的函数执行完成，准备jump回去时，再次保存上下文，此时同样利用call指令的特性，自动在栈上保存了rip寄存器的值。
+    // 保存完成弹出__entry(rip)时，其实就是弹出了第一次call指令压入的rip，
+    // 如果第一次是从main函数跳转，那么此时就会回到main函数调用tb_context_jump函数的下一条指令，这样就实现了恢复执行。
     
     // save the hidden argument: retval (from-context)
+    // 将返回值压栈，后续pop到上下文中
+    // 根据微软x64调用约定，返回值大于8字节的参数，在调用者栈上分配，并作为函数的第一个参数。
+    // 因此rcx存储返回值的地址，其余参数右移，即rdx存储context、r8存储priv。
     pushq %rcx
 
     // save registers and construct the current context
+    // 根据调用约定，这些寄存器在使用时需要保护，将他们入栈，后续pop到上下文中
     pushq %rbp
     pushq %rbx
     pushq %rsi
@@ -171,18 +246,27 @@ function(tb_context_jump)
     popq %r15
     popq %rdi
     popq %rsi
+    // rbx = context_data[80..88]，该位置存储的是目标函数的地址
     popq %rbx
+    // rbp = context_data[88..96]，该位置存储的是__end(rip)，即默认退出
     popq %rbp
 
     // restore retval (saved) to rax
+    // 将返回值的地址恢复到rax中
+    // 恢复的地址这里对应context_data[96..104]存储的是context_data[128]的地址。
+    // 而context_data[128..144]存储的是函数返回值from
     popq %rax
 
     // restore the return or function address(r10)
+    // 恢复__entry(rip)地址
     popq %r10
 
     // return from-context(retval: [rcx](context: r9, priv: r8)) from jump
     // it will write context (unused) and priv (unused) when jump to a new context function entry first
+    // 将旧的上下文保存到返回值from.context
+    // r9存储的旧的上下文（如果第一次切换，这个上下就是rsp栈顶，如果内嵌切换，这个上下文就是context指针的地址，也是协程的栈底）
     movq %r9, (%rax)
+    // 将切换函数时，传递的用户数据保存到返回值from.priv
     movq %r8, 8(%rax)
 
     movq %rax, %rcx

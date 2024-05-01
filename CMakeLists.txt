@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.12)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 if(POLICY CMP0090)
     cmake_policy(SET CMP0090 NEW)
 endif()
@@ -74,3 +76,6 @@ if(BUILD_ALL)
     add_subdirectory(unitest)
     add_subdirectory(test)
 endif()
+
+add_executable(main main.cpp)
+target_link_libraries(main PRIVATE coost::co)
