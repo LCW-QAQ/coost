@@ -43,6 +43,12 @@
 #ifdef _WIN32
 
 /*
+ * https://blog.csdn.net/xkdlzy/article/details/108873014  CSDN Windows x64 调用约定
+ * https://learn.microsoft.com/zh-cn/cpp/build/x64-calling-convention?view=msvc-170 微软官网X64调用约定
+ * https://zh.wikipedia.org/wiki/X86%E8%B0%83%E7%94%A8%E7%BA%A6%E5%AE%9A 维基百科 调用约定
+ */
+
+/*
  * make context (refer to boost.context)
  *
  *
